@@ -1,0 +1,26 @@
+IRQ_Register_LISR num[1] entry[400082f9] comment: CTIRQ1
+IRQ_Register_LISR num[6] entry[81a1573] comment: L1SM handler
+IRQ_Register_LISR num[21] entry[8008c01] comment: RESIZER
+IRQ_Register_LISR num[33] entry[8008ba5] comment: ROTDMA
+IRQ_Register_LISR num[10] entry[800dae5] comment: GPT handler
+IRQ_Register_LISR num[10] entry[800dae5] comment: GPT handler
+IRQ_Register_LISR num[5] entry[8003251] comment: DMA handler
+IRQ_Register_LISR num[16] entry[8385411] comment: LCD ISR
+IRQ_Register_LISR num[7] entry[81235d5] comment: UART1
+IRQ_Register_LISR num[9] entry[8123631] comment: UART2
+IRQ_Register_LISR num[17] entry[81236b9] comment: UART3
+IRQ_Register_LISR num[8] entry[8003405] comment: KBD handler
+IRQ_Register_LISR num[14] entry[80037ed] comment: RTC handler
+IRQ_Register_LISR num[13] entry[8005001] comment: MSDC ISR
+IRQ_Register_LISR num[26] entry[800440d] comment: I2C ISR
+IRQ_Register_LISR num[17] entry[81236b9] comment: UART3
+IRQ_Register_LISR num[7] entry[81235d5] comment: UART1
+IRQ_Register_LISR num[12] entry[8038419] comment: USB
+IRQ_Register_LISR num[2] entry[805eb05] comment: L1D_CTIRQ2
+IRQ_Register_LISR num[3] entry[805e8f9] comment: L1D_DSP2CPU
+IRQ_Register_LISR num[20] entry[805e9c5] comment: L1D_DSP22CPU
+IRQ_Register_LISR num[9] entry[8123631] comment: UART2
+IRQ_Register_LISR num[11] entry[8030655] comment: EINT handler
+IRQ_Register_LISR num[11] entry[8030655] comment: EINT handler
+IRQ_Register_LISR num[4] entry[80f5eb1] comment: USIM_Lisr
+IRQ_Register_LISR num[11] entry[8030655] comment: EINT handler

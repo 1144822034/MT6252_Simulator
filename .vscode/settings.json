@@ -1,0 +1,29 @@
+{
+    "files.associations": {
+        "*.cjson": "jsonc",
+        "*.wxss": "css",
+        "*.wxs": "javascript",
+        "*.svg": "xml",
+        "*.luax": "latex",
+        "sdl.h": "c",
+        "unicorn.h": "c",
+        "time.h": "c",
+        "array": "c",
+        "istream": "c",
+        "ostream": "c",
+        "tuple": "c",
+        "type_traits": "c",
+        "utility": "c",
+        "string": "c",
+        "string_view": "c",
+        "windows.h": "c",
+        "ws2tcpip.h": "c",
+        "typedef.h": "c",
+        "pthread.h": "c",
+        "defined.h": "c",
+        "stdio.h": "c",
+        "config.h": "c",
+        "main.h": "c"
+    },
+    "makefile.configureOnOpen": false
+}

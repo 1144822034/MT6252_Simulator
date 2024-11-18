@@ -1,0 +1,7 @@
+bin/*.exe
+*.o
+*.id0
+*.id1
+*.id2
+*.nam
+build

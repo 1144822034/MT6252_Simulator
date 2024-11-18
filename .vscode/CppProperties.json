@@ -1,0 +1,15 @@
+{
+  "configurations": [
+    {
+      "inheritEnvironments": [
+        "mingw_64"
+      ],
+      "name": "Mingw64",
+      "includePath": [
+        "Lib\\SDL2-2.0.10\\i686-w64-mingw32\\include\\SDL2\\**",        
+        "Lib\\unicorn-2.0.1-win32\\include\\**"
+      ],
+      "intelliSenseMode": "linux-gcc-x64"
+    }
+  ]
+}

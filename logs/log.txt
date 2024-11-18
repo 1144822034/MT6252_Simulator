@@ -1,0 +1,40 @@
+SD_ReadSingleBlock(29c000)(6420)(813cf6a)
+read fat32.img(a:29c000,p:6420,c:200)
+singleRead Result(42)(4d)(76)(1)
+cacheFile(8253518)(1764d42)
+_Ven_AT_L___sprintf(24.10.20)
+
+
+SD_ReadSingleBlock(29b000)(5220)(813cf6a)
+read fat32.img(a:29b000,p:5220,c:200)
+singleRead Result(42)(4d)(76)(1)
+cacheFile(8253518)(1764d42)
+_Ven_AT_L___sprintf(24.10.20)
+
+
+SD_ReadSingleBlock(29a000)(5e20)(813cf6a)
+read fat32.img(a:29a000,p:5e20,c:200)
+singleRead Result(42)(4d)(36)(4)
+
+SD_ReadSingleBlock(29a000)(f02783c8)(813cf6a)
+read fat32.img(a:29a000,p:f02783c8,c:200)
+cacheFile(8253518)(0)
+singleRead Result(0)(0)(0)(0)
+
+
+
+_Ven_AT_L___sprintf(24.10.20)
+SD_ReadSingleBlock(29d000)(5e20)(813cf6a)
+read fat32.img(a:29d000,p:5e20,c:200)
+singleRead Result(42)(4d)(9e)(2)
+
+SD_ReadSingleBlock(29d000)(f02783c8)(813cf6a)
+read fat32.img(a:29d000,p:f02783c8,c:200)
+cacheFile(8253518)(0)
+singleRead Result(0)(0)(0)(0)
+_Ven_AT_L___sprintf(24.10.20)
+
+SD_ReadSingleBlock(2af000)(5e20)(813cf6a)
+read fat32.img(a:2af000,p:5e20,c:200)
+singleRead Result(42)(4d)(f6)(0)
+cacheFile(8253518)(f64d42)

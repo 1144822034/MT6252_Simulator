@@ -1,0 +1,7 @@
+mrc_initNetWork
+mrc_socket
+mrc_getHostByName
+mrc_connect
+mrc_getSocketState
+mrc_send/mrc_rev
+mrc_close

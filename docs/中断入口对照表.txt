@@ -1,0 +1,7 @@
+（1）复位异常     		0x0				reset
+（2）未定义异常  		0x4				undef
+（3）软件中断     		0x8				swi
+（4）预取中止     		0xc				pre_abort
+（5）数据中止  		    0x10			data_abort
+（6）irq         	    0x18			中断请求
+（7）fiq          		0x1c			快速中断请求

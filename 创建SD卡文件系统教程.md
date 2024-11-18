@@ -1,0 +1,4 @@
+- 双击bat生成512MB的fat32.img文件
+- 使用DiskGenius打开虚拟磁盘文件fat32.img，并新建一个Fat32分区，分区表MBR类型，并进行格式化操作
+- 将fat32.img文件放入bin\Rom目录
+- 运行main.exe，正常情况下打开文件管理可以看到SD已挂载
