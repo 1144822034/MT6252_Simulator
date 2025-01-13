@@ -1,4 +1,4 @@
-#ifndef __DEFINED__
+#pragma once
 
 #define u8 unsigned char
 #define u16 unsigned short
@@ -9,6 +9,12 @@
 #define MR_MOUSE_MOVE 3
 #define MR_KEY_PRESS 4
 #define MR_KEY_RELEASE 5
+
+#define CONFIG_base 0x81000000
+#define DRVPDN_CON0 (CONFIG_base + 0x0320)
+#define DRVPDN_CON1 (CONFIG_base + 0x0324)
+#define DRVPDN_CON2 (CONFIG_base + 0x0328)
+#define DRVPDN_CON3 (CONFIG_base + 0x032c)
 
 // nucleus os 定义
 #define NU_DRIVER_SUSPEND 10 // 设备暂停
@@ -31,38 +37,13 @@
 #define SCREEN_WIDTH 240
 #define SCREEN_HEIGHT 320
 
-#define CONFIG_START_ADDRESS 0x80000000
-#define CONFIG_SIZE 0x400000 // 4MB
-
-#define TDMA_START_ADDRESS 0x80200000
-#define TDMA_SIZE 0x400000 // 4MB
-
-#define INIT_SRAM_START_ADDRESS 0x40000000
-#define INIT_SRAM_SIZE 0x47000
-
-#define RAM_START_ADDRESS 0
-#define RAM_SIZE 0x300000 // 4MB
-
-#define ROM_START_ADDRESS 0x8000000
-#define ROM_SIZE 0x1000000 // 16MB
-#define ROM_END_ADDRESS (ROM_START_ADDRESS + ROM_SIZE)
-
-/**
- * 栈空间配置
- */
-#define STACK_SIZE 4096                                    // 栈大小
-#define STACK_START_ADDRESS (ROM_END_ADDRESS - STACK_SIZE) // 栈开始地址
-#define STACK_END_ADDRESS STACK_START_ADDRESS              // 栈结束地址
-
 #define SFI_TRIG 1   // 触发命令
 #define SFI_MAC_EN 2 // Memory Access Control
 #define SFI_WIP 4    // 表示正在写入中
 #define SFI_EN 8     // 开启使能
 
 #define RW_SFI_MAC_CTL 0x810a0000
-#define RW_SFI_GPRAM_DATA 0x810a0800
-#define RW_SFI_GPRAM_CMD_REG 0x810a0800  // 要发送的命令寄存器
-#define RW_SFI_GPRAM_DATA_REG 0x810a0804 // 要发送的数据寄存器?
+#define RW_SFI_GPRAM_DATA_REG 0x810a0800 // 要发送的数据寄存器?
 #define RW_SFI_GPRAM_BUSY_REG 0x83010a28 // Flash忙寄存器
 #define RW_SFI_OUTPUT_LEN_REG 0x810a0004 // 向Flash中写入多少字节
 #define RW_SFI_INPUT_LEN_REG 0x810a0008  // 从Flash中读取多少字节
@@ -99,6 +80,46 @@
 #define NOR_FLASH_BASE_ADDRESS 0x760000
 
 #define DMA_GLBSTA 0x81020000
+
+/**
+ *
+偏移地址	寄存器名称	描述
++0x00	TDMA_CTRL	控制寄存器，启动/停止 TDMA 功能。
++0x04	TDMA_SLOT_CFG	时隙配置寄存器，定义时隙的时序和用途。
++0x08	TDMA_SYNC	同步控制寄存器，用于与外部设备同步。
++0x0C	TDMA_INT_STATUS	中断状态寄存器，用于处理 TDMA 中断。
++0x10	TDMA_SLOT_COUNTER	当前时隙计数器。
+ *
+*/
+#define TMDA_BASE 0x82000000
+
+#define DMA_MSDC_CHANNEL 0x200
+#define DMA_SIM1_CHANNEL 0x300
+#define DMA_SIM2_CHANNEL 0x400
+
+#define DMA_MSDC_DATA_ADDR_REG (0x8102002C + DMA_MSDC_CHANNEL)
+#define DMA_MSDC_TRANSFER_COUNT_REG (0x81020010 + DMA_MSDC_CHANNEL)
+#define DMA_MSDC_CONTROL_REG (0x81020014 + DMA_MSDC_CHANNEL)
+#define DMA_MSDC_START_REG (0x81020018 + DMA_MSDC_CHANNEL)
+#define DMA_MSDC_INTSTA_REG (0x8102001C + DMA_MSDC_CHANNEL)
+
+#define DMA_SIM1_DATA_ADDR_REG (0x8102002C + DMA_SIM1_CHANNEL)
+#define DMA_SIM1_TRANSFER_COUNT_REG (0x81020010 + DMA_SIM1_CHANNEL)
+#define DMA_SIM1_CONTROL_REG (0x81020014 + DMA_SIM1_CHANNEL)
+#define DMA_SIM1_START_REG (0x81020018 + DMA_SIM1_CHANNEL)
+#define DMA_SIM1_INTSTA_REG (0x8102001C + DMA_SIM1_CHANNEL)
+
+#define DMA_SIM2_DATA_ADDR_REG (0x8102002C + DMA_SIM2_CHANNEL)
+#define DMA_SIM2_TRANSFER_COUNT_REG (0x81020010 + DMA_SIM2_CHANNEL)
+#define DMA_SIM2_CONTROL_REG (0x81020014 + DMA_SIM2_CHANNEL)
+#define DMA_SIM2_START_REG (0x81020018 + DMA_SIM2_CHANNEL)
+#define DMA_SIM2_INTSTA_REG (0x8102001C + DMA_SIM2_CHANNEL)
+
+#define DMA_FFPG_Count_REG (0x81020d10) // & 1 表示FIFO已满
+#define DMA_FFPG_ADDR_REG (0x81020d2c)  // & 1 0 表示FIFO已满 1 表示未满
+#define DMA_FFCNT_REG (0x81020d38)      // 可以解释为FIFO可用字节数
+#define DMA_FFSIZE_REG (0x81020d44)     // 可以解释为FIFO总字节数
+#define DMA_FFSTAT_REG (0x81020d3c)     // & 1 表示FIFO已满
 
 #define GPTIMER1_CON 0x81060000
 
@@ -197,6 +218,8 @@
 #define IRQ_MASK_STA_H 0x81010074 // 中断掩码寄存器
 #define IRQ_Status 0x810100d8     // 中断状态寄存器
 
+#define RTC_IRQ_STATUS 0x810B0004
+
 #define IRQ_EOI2 0x810100dc
 #define IRQ_EOIL 0x810100a0 // 中断完成寄存器
 #define IRQ_EOIH 0x810100a4 // 中断完成寄存器
@@ -212,11 +235,44 @@
 
 #define TCD_Current_Thread 0x4000b238
 
+#define UART1_RX_Buffer 0x81030000
+#define UART2_RX_Buffer 0x81040000
+#define UART3_RX_Buffer 0x81050000
+
 #define UART_Interrupt_Identification_REG 0x81030008
 #define UART_LINE_STATUS_REG 0x81030014
-// 应该是0x18，但有问题
+
+#define UART_RX_REG(n) (0x78000000 + 0x100 * (n - 1))
+#define UART_TX_REG(n) (0x78000300 + 0x100 * (n - 1))
+
 #define IRQ_HANDLER 0x4000A290 // 中断入口地址
-#define IRQ_HANDLER 0x4000A290 // 中断入口地址
+#define IRQ_TABLE 0x4000C840   // 中断函数表地址
+
+#define SIM1_BASE 0x81090000
+#define SIM1_IRQ_ENABLE 0x81090010
+#define SIM1_IRQ_STATUS 0x81090014 // SIM_INS
+#define SIM1_TIDE 0x81090024       // 低8位全部置0表示RX_IDE，第二个字节的低8位全部置0表示TX_IDE
+#define SIM1_DATA 0x81090030
+#define SIM1_COUNT 0x81090034
+#define SIM1_TOUT 0x81090048
+#define SIM1_INS_REG 0x81090060
+#define SIM1_SW1_REG 0x81090068
+#define SIM1_SW2_REG 0x8109006C
+#define SIM1_CARD_TYPE_REG 0x81090070
+#define SIM1_STATUS_REG 0x81090074
+
+#define SIM2_BASE 0x810f0000
+#define SIM2_IRQ_ENABLE 0x810f0010
+#define SIM2_IRQ_STATUS 0x810f0014 // SIM_INS
+#define SIM2_TIDE 0x810f0024       // 低8位全部置0表示RX_IDE，第二个字节的低8位全部置0表示TX_IDE
+#define SIM2_DATA 0x810f0030
+#define SIM2_COUNT 0x810f0034
+#define SIM2_TOUT 0x810f0048
+#define SIM2_INS_REG 0x810f0060
+#define SIM2_SW1_REG 0x810f0068
+#define SIM2_SW2_REG 0x810f006C
+#define SIM2_CARD_TYPE_REG 0x810f0070
+#define SIM2_STATUS_REG 0x810f0074
 
 typedef enum
 {
@@ -331,4 +387,98 @@ typedef enum
 
 #define MSDC_Handle_Adr 0xF01D2894
 
-#endif
+typedef enum
+{
+    SIM,
+    MSDC,
+    UNK1,
+    UNK2,
+    USB1_TX,
+    USB1_RX,
+    USB2_TX,
+    USB2_RX,
+    UART1_RX,
+    UART1_TX,
+    UART2_RX,
+    UART2_TX,
+    UART3_RX,
+    UART3_TX,
+    DSP,
+    UNK3,
+    UNK4,
+    I2C_TX,
+    I2C_RX,
+    SIM2,
+    DSP2
+} DMA_MASTER_CHANEL;
+
+typedef enum
+{
+    DMA_DATA_RAM_TO_REG,
+    DMA_DATA_REG_TO_RAM
+} DMA_DATA_DIRECTION;
+
+typedef enum
+{
+    DMA_DATA_BYTE_ALIGN_ONE,
+    DMA_DATA_BYTE_ALIGN_TWO,
+    DMA_DATA_BYTE_ALIGN_FOUR
+} DMA_DATA_BYTE_ALIGN;
+
+typedef enum
+{
+    VM_EVENT_NONE,
+    VM_EVENT_KEYBOARD,
+    VM_EVENT_Timer_IRQ,
+    VM_EVENT_MSDC_IO_OK,
+    VM_EVENT_MSDC_IO_CALLBACK,
+    VM_EVENT_RTC_IRQ,
+    VM_EVENT_GPT_IRQ,
+    VM_EVENT_SIM_IRQ,
+    VM_EVENT_SIM_T0_TX_END,
+    VM_EVENT_SIM_T0_RX_END,
+    VM_EVENT_DMA_IRQ,
+    VM_EVENT_MSDC_IRQ
+} VM_EVENT;
+
+typedef enum
+{
+    SIM_DEV_EVENT_NONE,
+    SIM_DEV_EVENT_DEBUG,
+    SIM_DEV_EVENT_DEBUG_N,
+    SIM_DEV_EVENT_ATR_PRE,
+    SIM_DEV_EVENT_ATR_CIRCLE_DATA,
+    SIM_DEV_EVENT_NOATR,
+    SIM_DEV_EVENT_ATR,
+    SIM_DEV_EVENT_PTS,
+    SIM_DEV_EVENT_CMD
+} SIM_DEV_EVENT;
+
+// rx_handler
+// changeTmp1 = 0x200; // t1_end
+// changeTmp1 = 0x100; // rx error
+// changeTmp1 = 0x400; // edc error
+// changeTmp1 = 0x20; // NO_ATR
+// changeTmp1 = 0x8; // timeout
+
+typedef enum
+{
+    SIM_IRQ_NONE = 0,
+    SIM_IRQ_RX = 2,
+    SIM_IRQ_TX = 1,
+    SIM_IRQ_RXERR = 0x100,
+    SIM_IRQ_TOUT = 8,
+    SIM_IRQ_T0END = 0x80,
+    SIM_IRQ_NOATR = 0x20,
+    SIM_IRQEN_CMDDMANormal = 0x19c,
+    SIM_IRQEN_CMDNormal = 0x19e,
+    SIM_IRQ_EDCERR = 0x400,
+    SIM_IRQ_T1END = 0x200,
+    SIM_IRQ_DMA_CMD = 0x800,
+} SIM_IRQ_CHANNEL;
+
+typedef enum
+{
+    VM_MSDC_EVENT_NONE,
+    VM_MSDC_EVENT_IO_REQUEST
+} VM_MSDC_EVENT;

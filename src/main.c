@@ -1,40 +1,19 @@
 #include "main.h"
 #include "myui.c"
+#include "my_lib.c"
 #include "mysocket.c"
+#include "sim.c"
 
-typedef struct _bitmap
-{
-    u32 xsize;
-    u32 ysize;
-    u8 color_depth;
-    u32 row_bytes;
-    u32 palette_ptr;
-    u32 data_ptr;
-    u8 inited;
-    u32 screen_buff_size;
-    u8 *real_screen_buff;
-} bitmap;
-enum
-{
-    SD_DMA_Read,
-    SD_DMA_Write
-};
-u32 SEND_SDCMD_CACHE; // SD命令缓存
-u32 SDCMD_CACHE;
-u32 SEND_SDDATA_CACHE; // SD数据缓存
-u32 SD_READ_ADDR;      // SD文件系统读取地址
-u32 SD_Write_ADDR;     // SD文件系统写入地址
-
-u32 DMA_Data_Transfer_Ptr;    // DMA搬运数据源地址
-u32 DMA_Transfer_Bytes_Count; // DMA搬运数据字节数
-u32 SD_Multi_Read_Count;      // 连续读块数
-u32 SD_DMA_Type;              // 0表示读取SD数据块 1表示写SD数据块
-
-bitmap screen_bit;
-u32 screenBufferSize = 480 * 320;
-
+u32 MSDC_CMD_CACHE;
+u32 MSDC_DATA_ADDR;
+u8 is_uc_exited = 0;
+u8 ATR_Count;
+u32 lastSimIRQEnable;
+u32 screenBufferSize = LCD_SCREEN_HEIGHT * 2 * LCD_SCREEN_HEIGHT;
 u8 ucs2Tmp[128] = {0}; // utf16-le转utf-8 缓存空间
 
+u8 uartBuffer[1024];
+u8 uartBufferNum = 0;
 socketHandle *sh1;
 
 struct uc_context *callback_context;
@@ -43,19 +22,24 @@ struct uc_context *timer_isr_context;
 
 FILE *SD_File_Handle;
 FILE *FLASH_File_Handle;
-static pthread_mutex_t mutex; // 线程锁
+
+static pthread_mutex_t vm_event_queue_mutex; // 线程锁
+
 clock_t render_time;
 clock_t last_timer_interrupt_time;
 clock_t last_rtc_interrupt_time;
-u32 lastFlashTime;
-// 中断间隔
-u32 interruptPeroidms = 3;
-u32 lastAddress = 0;
+clock_t last_sim_interrupt_time;
+clock_t last_gpt_interrupt_time;
+clock_t currentTime;
 
+u32 lastCmdFlushTime;
+vm_event VmEventHandleList[256];
+vm_event *firstEvent;
+u32 VmEventPtr = 0;
+bool VmEventMutex;
 static SDL_Window *window;
 static SDL_Keycode isKeyDown = SDLK_UNKNOWN;
 static bool isMouseDown = false;
-static uc_engine *MTK;
 static pthread_t emu_thread;
 static pthread_t screen_render_thread;
 int debugType = 0;
@@ -63,15 +47,9 @@ u8 globalSprintfBuff[256] = {0};
 u8 sprintfBuff[256] = {0};
 u8 currentProgramDir[256] = {0};
 
-u32 stackCallback[17];
-bool isEnterCallback;
 int simulateKey = -1;
 int simulatePress = -1;
-u32 changeTmp = 0;
-u32 changeTmp1 = 0;
-u32 changeTmp2 = 0;
-u32 changeTmp3 = 0;
-u32 lastSprintfPtr = 0;
+u32 kalSprintfBuffPtr;
 
 u32 lcdUpdateFlag = 0;
 u32 size_32mb = 1024 * 1024 * 32;
@@ -85,43 +63,30 @@ u8 *dataCachePtr;
 int irq_nested_count;
 u32 *isrStackPtr;
 u32 isrStackList[10][17];
+u32 stackCallback[17];
 
 u8 *ROM_MEMPOOL;
 u8 *RAM_MEMPOOL;
 u8 *RAM40_POOL;
 u8 *RAMF0_POOL;
 
-u8 enterIrqSave;
-u32 buff1, buff2;
-char *pp;
-
-bool needUpdateLCD;
 // 最多四层
 u32 LCD_Layer_Address[4];
 
-clock_t currentTime = 0;
-
 u32 IRQ_MASK_SET_L_Data;
 
-struct SF_Control
+struct SerialFlash_Control
 {
+    u8 SR_REG[3];
     u8 cmd;
     u32 address;
-    u32 data;
-    u32 len;
     u8 cmdRev; // 1 = 命令已接收
-    bool sendDataMode;
     u32 sendDataCount;
-    u32 sentCount;
-    u32 cacheData[64];
     u32 readDataCount;
-    u8 *SendData;
-    u8 *InputData;
+    u32 cacheData[64];
 };
 
-struct SF_Control SF_C_Frame;
-
-u32 sendCount;
+struct SerialFlash_Control SF_C_Frame;
 
 /**
 key_pad_comm_def->keypad[72]解释index=17表示开机按钮
@@ -265,6 +230,7 @@ void keyEvent(int type, int key)
         simulateKey = 11; // #
     }
     simulatePress = type == 4 ? 1 : 0;
+    EnqueueVMEvent(VM_EVENT_KEYBOARD, simulateKey, simulatePress);
 }
 
 void mouseEvent(int type, int data0, int data1)
@@ -300,19 +266,32 @@ void mouseEvent(int type, int data0, int data1)
 // 更新RTC时钟寄存器
 void Update_RTC_Time()
 {
-    changeTmp1 = 10;
+    time_t now = time(NULL);
+    struct tm *local_time = localtime(&now);
+
+    uc_mem_read(MTK, 0x810b0000, &changeTmp1, 4);
+    if (changeTmp1 != 2)
+    {
+        changeTmp1 = 2; // 2表示计数器中断 1表示闹钟中断
+        uc_mem_write(MTK, RTC_IRQ_STATUS, &changeTmp1, 4);
+        changeTmp1 = 0; // 只有秒=0时才会触发更新
+    }
+    else
+    {
+        changeTmp1 = local_time->tm_sec; // 只有秒=0时才会触发更新
+    }
     uc_mem_write(MTK, 0x810b0014, &changeTmp1, 4); // 秒
-    changeTmp1 = 30;
+    changeTmp1 = local_time->tm_min;
     uc_mem_write(MTK, 0x810b0018, &changeTmp1, 4); // 分
-    changeTmp1 = 12;
+    changeTmp1 = local_time->tm_hour;
     uc_mem_write(MTK, 0x810B001C, &changeTmp1, 4); // 时
-    changeTmp1 = 1;
+    changeTmp1 = local_time->tm_mday;
     uc_mem_write(MTK, 0x810b0020, &changeTmp1, 4); // 日
-    changeTmp1 = 0;
+    changeTmp1 = local_time->tm_wday;
     uc_mem_write(MTK, 0x810b0024, &changeTmp1, 4); // 星期
-    changeTmp1 = 1;
+    changeTmp1 = local_time->tm_mon;
     uc_mem_write(MTK, 0x810b0028, &changeTmp1, 4); // 月
-    changeTmp1 = 13;
+    changeTmp1 = local_time->tm_year - 100;        // 手机系统时间是从2000年开始， 时间修正
     uc_mem_write(MTK, 0x810b002c, &changeTmp1, 4); // 年
 }
 
@@ -407,6 +386,30 @@ u8 *readFile(const char *filename, u32 *size)
     }
     fclose(file);
     return tmp;
+}
+
+int writeFile(const char *filename, void *buff, u32 size)
+{
+    FILE *file;
+    u8 *tmp;
+    u8 flag;
+    // 打开文件 a.txt
+    file = fopen(filename, "w");
+    if (file == NULL)
+    {
+        fclose(file);
+        return 0;
+    }
+    // 移动文件指针到文件末尾，获取文件大小
+    fseek(file, 0, SEEK_SET);
+    // 读取文件内容到 tmp 中
+    size_t result = fwrite(buff, 1, size, file);
+    if (result != size)
+    {
+        printf("Failed to write file\n");
+    }
+    fclose(file);
+    return result;
 }
 
 u8 *readSDFile(u32 startPos, u32 size)
@@ -512,6 +515,11 @@ bool writeFlashFile(u8 *Buffer, u32 startPos, u32 size)
     }
     return true;
 }
+void dumpMemoryToFile(char *filename, u32 virt_addr, int size)
+{
+    char *p = getRealMemPtr(virt_addr);
+    writeFile(filename, p, size);
+}
 /**
  * 初始化模拟CPU引擎与内存
  *
@@ -529,31 +537,30 @@ void initMtkSimalator()
 
     ROM_MEMPOOL = malloc(size_16mb);
     RAM_MEMPOOL = malloc(size_8mb);
-
     // 映射寄存器
     err = uc_mem_map_ptr(MTK, 0x80000000, size_8mb, UC_PROT_ALL, malloc(size_8mb));
     // GPIO_BASE_ADDRESS
     err = uc_mem_map_ptr(MTK, 0x81000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
-    err = uc_mem_map_ptr(MTK, 0x82000000, size_4mb, UC_PROT_ALL, malloc(size_4mb));
+    err = uc_mem_map_ptr(MTK, TMDA_BASE, size_4mb, UC_PROT_ALL, malloc(size_4mb));
     err = uc_mem_map_ptr(MTK, 0x83000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
     err = uc_mem_map_ptr(MTK, 0x84000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
-    err = uc_mem_map_ptr(MTK, 0x85000000, size_8mb, UC_PROT_ALL, malloc(size_8mb));
+    err = uc_mem_map_ptr(MTK, 0x85000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
     // 未知 分区
     err = uc_mem_map_ptr(MTK, 0x70000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
     err = uc_mem_map_ptr(MTK, 0x78000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
     err = uc_mem_map_ptr(MTK, 0x90000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
     err = uc_mem_map_ptr(MTK, 0xA0000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
     err = uc_mem_map_ptr(MTK, 0xA1000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
-    err = uc_mem_map_ptr(MTK, 0xA2000000, size_8mb, UC_PROT_ALL, malloc(size_8mb));
-    err = uc_mem_map_ptr(MTK, 0xA3000000, size_8mb, UC_PROT_ALL, malloc(size_8mb));
-    err = uc_mem_map_ptr(MTK, 0xE5900000, size_8mb, UC_PROT_ALL, malloc(size_8mb));
-    RAMF0_POOL = malloc(size_16mb);
-    err = uc_mem_map_ptr(MTK, 0xF0000000, size_16mb, UC_PROT_ALL, RAMF0_POOL);
+    err = uc_mem_map_ptr(MTK, 0xA2000000, size_4mb, UC_PROT_ALL, malloc(size_4mb));
+    err = uc_mem_map_ptr(MTK, 0xA3000000, size_4mb, UC_PROT_ALL, malloc(size_4mb));
+    // err = uc_mem_map_ptr(MTK, 0xE5900000, size_4mb, UC_PROT_ALL, malloc(size_4mb));
+    RAMF0_POOL = malloc(size_8mb);
+    err = uc_mem_map_ptr(MTK, 0xF0000000, size_8mb, UC_PROT_ALL, RAMF0_POOL);
     err = uc_mem_map_ptr(MTK, 0x01FFF000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
     // 映射ROM
     err = uc_mem_map_ptr(MTK, 0x08000000, size_16mb, UC_PROT_ALL, ROM_MEMPOOL);
     // 中断栈
-    err = uc_mem_map_ptr(MTK, 0x50000000, size_1mb, UC_PROT_ALL, malloc(size_1mb));
+    err = uc_mem_map_ptr(MTK, CPU_ISR_CB_ADDRESS, size_1mb, UC_PROT_ALL, malloc(size_1mb));
 
     if (err)
     {
@@ -573,19 +580,24 @@ void initMtkSimalator()
     }
     // hook kal_fatal_error_handler
     // err = uc_hook_add(uc, &trace, UC_HOOK_CODE, hookCodeCallBack, 0, 0, 0xFFFFFFFF);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 1, 0x8363840, 0x8363858);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 2, 0x82acba8, 0x82acbab);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 3, 0x82ac688, 0x82ac68b);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 4, 0x50000000, 0x50000004);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 5, 0x50000008, 0x5000000b);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 6, 0x82D2A22, 0x82D2A24);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 7, 0x8239244, 0x8239248);
+    // 中断
+    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 4, CPU_ISR_CB_ADDRESS, CPU_ISR_CB_ADDRESS + 4);
+    // 回调
+    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 5, CPU_ISR_CB_ADDRESS + 8, CPU_ISR_CB_ADDRESS + 12);
+    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 7, 0x4000801E, 0x4000801F);
+    err = uc_hook_add(MTK, &trace, UC_HOOK_BLOCK, hookBlockCallBack, 8, 0, 0xffffffff);
 
-    err = uc_hook_add(MTK, &trace, UC_HOOK_CODE, hookCodeCallBack, 0, 0, 0xF4FFFFFF);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_READ, hookRamCallBack, 0, 0x80000000, 0x82000000);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_READ, hookRamCallBack, 0, 0x82050000, 0x83000000);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_READ, hookRamCallBack, 0, 0x90000000, 0xF0000000);
-    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_WRITE, hookRamCallBack, 1, 0x81000000, 0xF0000000);
+    err = uc_hook_add(MTK, &trace, UC_HOOK_CODE, hookCodeCallBack, 0, 0x08000000, 0x09000000);
+
+    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_READ, hookRamCallBack, 0, 0x80000000, 0xA2000000);
+
+    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_READ, hookRamCallBack, 0, 0x5f288, 0x5f888);
+
+    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_WRITE, hookRamCallBack, 1, 0x78000000, 0x78f00000);
+    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_WRITE, hookRamCallBack, 1, 0x80000000, 0x81ffffff);
+    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_WRITE, hookRamCallBack, 1, 0x90000000, 0x91000000);
+    err = uc_hook_add(MTK, &trace, UC_HOOK_MEM_WRITE, hookRamCallBack, 1, 0xf0000000, 0xf2000000);
+
     if (err != UC_ERR_OK)
     {
         printf("add hook err %u (%s)\n", err, uc_strerror(err));
@@ -626,17 +638,30 @@ void dumpCpuInfo()
     uc_reg_read(MTK, UC_ARM_REG_R4, &r4);
     printf("r0:%x r1:%x r2:%x r3:%x r4:%x r5:%x r6:%x r7:%x r8:%x r9:%x\n", r0, r1, r2, r3, r4);
     printf("msp:%x cpsr:%x(thumb:%x)(mode:%x) lr:%x pc:%x lastPc:%x irq_c(%x)\n", msp, cpsr, (cpsr & 0x20) > 0, cpsr & 0x1f, lr, pc, lastAddress, irq_nested_count);
+    printf("sim_dev(rx_irq:%x)\n", vm_sim1_dev.irq_enable & 2);
     printf("------------\n");
 }
 
 void RunArmProgram(void *startAddr)
 {
+    // 初始化sim卡的atr响应数据
+    // u8 atr_rsp[] = {0x3B, 0x9f, 0x96, 0x00, 0xFF, 0x91, 0x81, 0x71, 0xFE, 0x55};
+    // 模拟中国移动sim卡atr数据
 
+    vm_sim1_dev.event = VM_EVENT_NONE;
+    vm_sim1_dev.is_rst = 0;
+    vm_sim1_dev.tx_buffer_index = 0;
+    vm_sim1_dev.rx_buffer_index = 0;
     u32 startAddress = (u32)startAddr;
     uc_err p;
     // 启动前工作
-
+    // changeTmp = 1;
+    // uc_mem_write(MTK, SIM1_BASE, &changeTmp, 4);
     // 过寄存器检测
+    changeTmp = 0x1234;
+    uc_mem_write(MTK, 0xA10001D4, &changeTmp1, 4);
+    changeTmp = 0x20;
+    uc_mem_write(MTK, 0xf018cfe5, &changeTmp, 1);
     changeTmp = 2;
     uc_mem_write(MTK, 0x81060010, &changeTmp, 2);
     // 过方法sub_80017C0
@@ -658,7 +683,7 @@ void RunArmProgram(void *startAddr)
     // 过sub_819E8EC方法
     u32 unk_data = 0x20;
     uc_mem_write(MTK, UART_LINE_STATUS_REG, &unk_data, 4);
-    // 过sub_8000D9C方法，这里貌似也可以直接跳过
+    // 过sub_8000D9C方法
     unk_data = 25168;
     uc_mem_write(MTK, 0x80010008, &unk_data, 4);
     // 过sub_8703796方法
@@ -682,12 +707,8 @@ void RunArmProgram(void *startAddr)
         printf("模拟错误：此处内存不可执行\n");
     else if (p != UC_ERR_OK)
         printf("模拟错误：(未处理)%s\n", uc_strerror(p));
+    is_uc_exited = 1;
     dumpCpuInfo();
-}
-
-void *ThreadRun(void *p)
-{
-    RunArmProgram(p);
 }
 
 void ScreenRenderThread()
@@ -696,10 +717,68 @@ void ScreenRenderThread()
     {
         currentTime = clock();
         renderGdiBufferToWindow();
-        if (currentTime > lastFlashTime)
+        if (currentTime > lastCmdFlushTime)
         {
-            lastFlashTime = currentTime + 100;
+            lastCmdFlushTime = currentTime + 100;
             fflush(stdout);
+        }
+        /*
+        if (currentTime > last_gpt_interrupt_time)
+        {
+            last_gpt_interrupt_time = currentTime + 1100;
+            EnqueueVMEvent(VM_EVENT_GPT_IRQ, 0, 0);
+        }*/
+        if (currentTime > last_timer_interrupt_time)
+        {
+            last_timer_interrupt_time = currentTime + interruptPeroidms;
+            EnqueueVMEvent(VM_EVENT_Timer_IRQ, 0, 0);
+        }
+        else if (currentTime > last_rtc_interrupt_time)
+        {
+            last_rtc_interrupt_time = currentTime + 500;
+            EnqueueVMEvent(VM_EVENT_RTC_IRQ, 0, 0);
+        }
+        else if (currentTime > last_sim_interrupt_time)
+        {
+            last_sim_interrupt_time = currentTime + interruptPeroidms;
+            if (irq_nested_count == 0)
+            {
+                if ((vm_sim1_dev.irq_enable & vm_sim1_dev.irq_channel) != 0 && vm_sim1_dev.irq_start) // 允许对应通道中断
+                {
+                    vm_sim1_dev.irq_start = false;
+                    EnqueueVMEvent(VM_EVENT_SIM_IRQ, vm_sim1_dev.irq_channel, 0);
+                }
+                else if ((vm_sim2_dev.irq_enable & vm_sim2_dev.irq_channel) != 0 && vm_sim2_dev.irq_start) // 允许对应通道中断
+                {
+                    vm_sim2_dev.irq_start = false;
+                    EnqueueVMEvent(VM_EVENT_SIM_IRQ, vm_sim2_dev.irq_channel, 1);
+                }
+                // 开启SIM_DMA后进行命令处理，处理完成后进入t0_end中断
+                else if (vm_dma_sim1_config.config_finish == 1)
+                {
+                    vm_dma_sim1_config.config_finish = 0;
+                    if (vm_dma_sim1_config.direction == DMA_DATA_RAM_TO_REG) // 设备向SIM卡写入命令
+                    {
+                        EnqueueVMEvent(VM_EVENT_SIM_T0_TX_END, 0, 0);
+                    }
+                    else
+                    { // SIM卡向设备写入数据
+                        EnqueueVMEvent(VM_EVENT_SIM_T0_RX_END, 0, 0);
+                    }
+                }
+                else if (vm_dma_sim2_config.config_finish == 1)
+                {
+                    vm_dma_sim2_config.config_finish = 0;
+                    if (vm_dma_sim2_config.direction == DMA_DATA_RAM_TO_REG) // 设备向SIM卡写入命令
+                    {
+                        EnqueueVMEvent(VM_EVENT_SIM_T0_TX_END, 1, 0);
+                    }
+                    else
+                    { // SIM卡向设备写入数据
+                        EnqueueVMEvent(VM_EVENT_SIM_T0_RX_END, 1, 0);
+                    }
+                }
+            }
         }
         usleep(1000);
     }
@@ -714,13 +793,14 @@ int main(int argc, char *args[])
         printf("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
         return -1;
     }
-    window = SDL_CreateWindow("IHD316(MTK6252) Simulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_OPENGL);
+    window = SDL_CreateWindow("IHD316(MTK6252) Simulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, LCD_SCREEN_WIDTH, LCD_SCREEN_HEIGHT, SDL_WINDOW_OPENGL);
     if (window == NULL)
     {
         printf("Window could not be created! SDL_Error: %s\n", SDL_GetError());
         return -1;
     }
-
+    firstEvent = &VmEventHandleList[0];
+    pthread_mutex_init(&vm_event_queue_mutex, NULL);
     initMtkSimalator();
 
     if (MTK != NULL)
@@ -736,7 +816,12 @@ int main(int argc, char *args[])
 
         SD_File_Handle = fopen(SD_CARD_IMG_PATH, "r+b");
         if (SD_File_Handle == NULL)
-            printf("没有SD卡镜像文件，跳过加载\n");
+        {
+            SD_File_Handle = fopen(SD_CARD_IMG_PATH, "r");
+            printf("SD卡镜像文件已被占用，尝试只读方式打开");
+            if (SD_File_Handle == NULL)
+                printf("没有SD卡镜像文件，跳过加载");
+        }
         /*
     FLASH_File_Handle = fopen(FLASH_IMG_PATH, "r+b");
     if (FLASH_File_Handle == NULL)
@@ -763,9 +848,9 @@ int main(int argc, char *args[])
         // 禁用缓冲自动刷新
         setvbuf(stdout, NULL, _IOFBF, 10240); // 设置缓冲区大小为 10k 字节
         // 启动emu线程
-        pthread_create(&emu_thread, NULL, ThreadRun, 0x8000000);
+        pthread_create(&emu_thread, NULL, RunArmProgram, 0x8000000);
         pthread_create(&screen_render_thread, NULL, ScreenRenderThread, 0);
-        printf("Unicorn Engine Initialized\n");
+        printf("Unicorn Engine 初始化成功！！\n");
     }
     loop();
     if (SD_File_Handle != NULL)
@@ -774,7 +859,7 @@ int main(int argc, char *args[])
         fclose(FLASH_File_Handle);
     return 0;
 }
-
+u16 screenBuffer[LCD_SCREEN_WIDTH * LCD_SCREEN_HEIGHT];
 void renderGdiBufferToWindow()
 {
     // 获取窗口的表面
@@ -794,13 +879,13 @@ void renderGdiBufferToWindow()
             pz = LCD_Layer_Address[li];
             if (pz > 0)
             {
-                realPtr = getRealMemPtr(pz);
-                for (u16 i = 0; i < 320; i++)
+                uc_mem_read(MTK, pz, screenBuffer, LCD_SCREEN_WIDTH * LCD_SCREEN_HEIGHT * 2);
+                for (u16 i = 0; i < LCD_SCREEN_HEIGHT; i++)
                 {
-                    for (u16 j = 0; j < 240; j++)
+                    for (u16 j = 0; j < LCD_SCREEN_WIDTH; j++)
                     {
-                        pz = (j + i * 240);
-                        color = *((u16 *)realPtr + pz);
+                        pz = (j + i * LCD_SCREEN_WIDTH);
+                        color = *((u16 *)screenBuffer + pz);
                         // 不是透明的，覆盖上个图层颜色
                         if (color != 0x1f)
                             *((Uint32 *)screenSurface->pixels + pz) = SDL_MapRGB(screenSurface->format, PIXEL565R(color), PIXEL565G(color), PIXEL565B(color));
@@ -815,88 +900,214 @@ void renderGdiBufferToWindow()
         lcdUpdateFlag = false;
     }
 }
+
+void EnqueueVMEvent(u32 event, u32 r0, u32 r1)
+{
+    if (is_uc_exited == 1)
+        return;
+    pthread_mutex_lock(&vm_event_queue_mutex);
+    if (VmEventPtr < 256)
+    {
+        vm_event *evt = &VmEventHandleList[VmEventPtr++];
+        evt->event = event;
+        evt->r0 = r0;
+        evt->r1 = r1;
+    }
+    pthread_mutex_unlock(&vm_event_queue_mutex);
+}
+
+vm_event *DequeueVMEvent()
+{
+    vm_event *evt = 0;
+    // todo 此处没有等待锁，所以要做失败判断
+    pthread_mutex_lock(&vm_event_queue_mutex);
+    if (VmEventPtr > 0)
+    {
+        evt = firstEvent;
+        --VmEventPtr;
+        for (u32 i = 0; i < VmEventPtr; i++)
+        {
+            VmEventHandleList[i] = VmEventHandleList[i + 1];
+        }
+    }
+    pthread_mutex_unlock(&vm_event_queue_mutex);
+    return evt;
+}
+
 void hookBlockCallBack(uc_engine *uc, uint64_t address, uint32_t size, void *user_data)
 {
-    u32 data = (u32)user_data;
-    switch (data)
+    vm_event *vmEvent;
+    switch ((u32)user_data)
     {
-    case 1:
-    { // 默认sim卡初始化完毕
-        changeTmp1 = 1;
-        uc_mem_write(MTK, 0xf029eeb5, &changeTmp1, 1);
-    }
-    break;
-    case 2:
-    { // MSDC_DMATransferFirst
-        uc_reg_read(MTK, UC_ARM_REG_R0, &DMA_Data_Transfer_Ptr);
-        uc_reg_read(MTK, UC_ARM_REG_R1, &DMA_Transfer_Bytes_Count);
-        uc_reg_read(MTK, UC_ARM_REG_R2, &SD_DMA_Type);
-        DMA_Transfer_Bytes_Count *= 4;
-        // printf("MSDC_DMATransferFirst(%x,%x,%x)\n", DMA_Data_Transfer_Ptr, DMA_Transfer_Bytes_Count, SD_DMA_Type);
-        //  如果是已经缓存的，把目标地址换为0xd820
-        uc_mem_read(MTK, 0xF01D28d2, &changeTmp1, 2);
-        if (changeTmp1 & 1)
-        {
-            DMA_Data_Transfer_Ptr = 0xd820;
-        }
-    }
-    break;
-    case 3:
-        // MSDC_DMATransferFinal
-        if (DMA_Data_Transfer_Ptr > 0)
-        {
-            if (SD_DMA_Type == SD_DMA_Read)
-            {
-                dataCachePtr = readSDFile(SD_READ_ADDR, DMA_Transfer_Bytes_Count);
-                if (dataCachePtr != NULL)
-                {
-                    uc_mem_write(MTK, DMA_Data_Transfer_Ptr, dataCachePtr, DMA_Transfer_Bytes_Count);
-                    // printf("read fat32.img(a:%x,p:%x,bc:%x)\n", SD_READ_ADDR, DMA_Data_Transfer_Ptr, DMA_Transfer_Bytes_Count);
-                    free(dataCachePtr);
-                }
-            }
-            else
-            {
-                // printf("write fat32.img(%x,%x,%x)\n", SD_Write_ADDR, DMA_Data_Transfer_Ptr, DMA_Transfer_Bytes_Count);
-                u8 *cache = malloc(DMA_Transfer_Bytes_Count);
-                if (cache != NULL)
-                {
-                    uc_mem_read(MTK, DMA_Data_Transfer_Ptr, cache, DMA_Transfer_Bytes_Count);
-                    writeSDFile(cache, SD_Write_ADDR, DMA_Transfer_Bytes_Count);
-                    free(cache);
-                }
-            }
-            DMA_Data_Transfer_Ptr = 0;
-        }
-        break;
     case 4: // 中断恢复
         RestoreCpuContext(&isrStackList[--irq_nested_count]);
         break;
     case 5: // 回调恢复
         RestoreCpuContext(&stackCallback);
         break;
-    case 6: // mr_sprintf
-        uc_mem_read(MTK, 0xF028EDC4, &globalSprintfBuff, 128);
-        printf("mr_sprintf(%s)(%x)\n", globalSprintfBuff, lastAddress);
+    case 7:
+        // 过方法sub_87035D4 (0x4000801E)
+        changeTmp = 1;
+        uc_reg_write(MTK, UC_ARM_REG_R0, &changeTmp);
         break;
-
-    default:
+    case 8: // 各种事件处理
+        if (VmEventPtr > 0)
+        {
+            vmEvent = DequeueVMEvent();
+            if (vmEvent != 0)
+            {
+                switch (vmEvent->event)
+                {
+                case VM_EVENT_KEYBOARD:
+                    // 按键中断
+                    if (StartInterrupt(8, address))
+                        SimulatePressKey(vmEvent->r0, vmEvent->r1);
+                    else // 如果处理失败，重新入队
+                        EnqueueVMEvent(vmEvent->event, vmEvent->r0, vmEvent->r1);
+                    break;
+                case VM_EVENT_SIM_IRQ:
+                    // 进入usim中断
+                    changeTmp1 = vmEvent->r0;
+                    if (vmEvent->r1 == 0)
+                    {
+                        uc_mem_write(MTK, SIM1_IRQ_STATUS, &changeTmp1, 4); // 卡一
+                        if (!StartInterrupt(5, address))
+                        {
+                            EnqueueVMEvent(vmEvent->event, vmEvent->r0, vmEvent->r1);
+                        }
+                    }
+                    if (vmEvent->r1 == 1)
+                    {
+                        uc_mem_write(MTK, SIM2_IRQ_STATUS, &changeTmp1, 4); // 卡二
+                        if (!StartInterrupt(28, address))
+                        {
+                            EnqueueVMEvent(vmEvent->event, vmEvent->r0, vmEvent->r1);
+                        }
+                    }
+                    break;
+                case VM_EVENT_SIM_T0_TX_END:
+                    if (vmEvent->r0 == 0)
+                    {
+                        handle_sim_tx_cmd(&vm_sim1_dev, vmEvent->r0, vm_dma_sim1_config.transfer_count, vm_dma_sim1_config.data_addr);
+                    }
+                    else if (vmEvent->r0 == 1)
+                    {
+                        handle_sim_tx_cmd(&vm_sim2_dev, vmEvent->r0, vm_dma_sim2_config.transfer_count, vm_dma_sim2_config.data_addr);
+                    }
+                    break;
+                case VM_EVENT_SIM_T0_RX_END:
+                    if (vmEvent->r0 == 0)
+                    {
+                        handle_sim_rx_cmd(&vm_sim1_dev, vmEvent->r0, vm_dma_sim1_config.transfer_count, vm_dma_sim1_config.data_addr);
+                    }
+                    else if (vmEvent->r0 == 1)
+                    {
+                        handle_sim_rx_cmd(&vm_sim2_dev, vmEvent->r0, vm_dma_sim2_config.transfer_count, vm_dma_sim2_config.data_addr);
+                    }
+                    break;
+                case VM_EVENT_DMA_IRQ:
+                    if (!StartInterrupt(6, address))
+                    {
+                        EnqueueVMEvent(vmEvent->event, vmEvent->r0, vmEvent->r1);
+                    }
+                    break;
+                case VM_EVENT_MSDC_IRQ:
+                    /*
+                    // todo 进入中断可以过多数据块读写的等待响应，但结果不正确
+                    changeTmp1 = 2;
+                    uc_mem_write(MTK, 0x810e0008, &changeTmp1, 4);
+                    changeTmp1 = 0;
+                    uc_mem_write(MTK, 0x810e0010, &changeTmp1, 4);
+                    if (!StartInterrupt(0xd, address))
+                    {
+                        EnqueueVMEvent(vmEvent->event, vmEvent->r0, vmEvent->r1);
+                    }*/
+                    break;
+                case VM_EVENT_GPT_IRQ:
+                    // GPT中断
+                    StartInterrupt(10, address);
+                    break;
+                case VM_EVENT_RTC_IRQ:
+                    Update_RTC_Time();
+                    StartInterrupt(14, address);
+                    break;
+                case VM_EVENT_Timer_IRQ:
+                    // 定时中断2号中断线
+                    StartInterrupt(2, address);
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
         break;
     }
 }
-
 void hookRamCallBack(uc_engine *uc, uc_mem_type type, uint64_t address, uint32_t size, int64_t value, u32 data)
 {
+    /*
+    if (data == 3 && address >= 0xa0000000 && address <= 0xa4000000)
+    {
+        printf("dsp write 0x%x,", address);
+        printf("0x%x,", value);
+        printf("0x%x\n", lastAddress);
+    }*/
     // 合并图像时，层数越小越底层，层数越大越顶层
     switch (address)
     {
+    case SIM1_CARD_TYPE_REG:
+        changeTmp1 = 0x20;
+        uc_mem_write(MTK, (u32)address, &changeTmp1, 1);
+        printf("read sim1_card_type(%x)\n", lastAddress);
+        break;
+    case SIM2_CARD_TYPE_REG:
+        // sim_MT6302_cardTypeAL=0x100(传统卡)
+        // sim_MT6302_cardTypeIR=0x80(红外卡)
+        changeTmp1 = 0x20;
+        uc_mem_write(MTK, (u32)address, &changeTmp1, 1);
+        printf("read sim2_card_type(%x)\n", lastAddress);
+        break;
+    case SIM1_TIDE:
+        if (data == 1)
+            SIM_TIDE_HANDLE(&vm_sim1_dev, 0, value);
+        break;
+    case SIM2_TIDE:
+        if (data == 1)
+            SIM_TIDE_HANDLE(&vm_sim2_dev, 1, value);
+        break;
+    case SIM1_IRQ_ENABLE:
+        if (data == 1)
+            SIM_IRQ_HANDLE(&vm_sim1_dev, 0, value);
+        break;
+    case SIM2_IRQ_ENABLE:
+        if (data == 1)
+            SIM_IRQ_HANDLE(&vm_sim2_dev, 1, value);
+        break;
+    case SIM1_BASE:
+        if (data == 1)
+            SIM_BASE_HANDLE(&vm_sim1_dev, 0, value);
+        break;
+    case SIM2_BASE:
+        if (data == 1)
+            SIM_BASE_HANDLE(&vm_sim2_dev, 1, value);
+        break;
+    case SIM1_DATA:
+        SIM_DATA_HANDLE(&vm_sim1_dev, 0, data, value);
+        break;
+    case SIM2_DATA:
+        SIM_DATA_HANDLE(&vm_sim2_dev, 1, data, value);
+        break;
     case 0x82050000: // 写1变0
         changeTmp = 0;
-        uc_mem_write(MTK, (u32)address, &changeTmp, 2);
+        uc_mem_write(MTK, (u32)address, &changeTmp, 4);
         break;
     case 0xa0000000:
         // 0x8094064 0x809404a过sub_8094040(L1层的)
         changeTmp = 0x5555;
+        uc_mem_write(MTK, (u32)address, &changeTmp, 4);
+        break;
+    case 0xA10003F6:
+        changeTmp = 0x8888;
         uc_mem_write(MTK, (u32)address, &changeTmp, 4);
         break;
     /*
@@ -938,152 +1149,132 @@ case 0xF01DC4FC:
             LCD_Layer_Address[0] = value;
         }
         break;
-
-    case RW_SFI_OUTPUT_LEN_REG: // 要写入的数据长度
+    case DMA_MSDC_CONTROL_REG:
         if (data == 1)
         {
-            SF_C_Frame.sendDataCount = value;
-            if (SF_C_Frame.InputData != NULL)
-            {
-                free(SF_C_Frame.InputData);
-                SF_C_Frame.InputData = NULL;
-            }
-            SF_C_Frame.InputData = malloc(value);
+            vm_dma_msdc_config.control = value;
+            vm_dma_msdc_config.chanel = (value >> 20) & 0b11111;
+            vm_dma_msdc_config.direction = (value >> 18) & 1;
+            vm_dma_msdc_config.align = value & 0b11;
+            vm_dma_msdc_config.transfer_end_interrupt_enable = (value >> 15) & 1;
         }
-
         break;
-    case RW_SFI_INPUT_LEN_REG: // 要读取的数据长度
+    case DMA_SIM1_CONTROL_REG:
         if (data == 1)
         {
-            SF_C_Frame.readDataCount = value;
-            if (SF_C_Frame.SendData != NULL)
-            {
-                free(SF_C_Frame.SendData);
-                SF_C_Frame.SendData = NULL;
-            }
-            SF_C_Frame.SendData = malloc(value);
+            vm_dma_sim1_config.control = value;
+            vm_dma_sim1_config.chanel = (value >> 20) & 0b11111;
+            vm_dma_sim1_config.direction = (value >> 18) & 1;
+            vm_dma_sim1_config.align = value & 0b11;
+            vm_dma_sim1_config.transfer_end_interrupt_enable = (value >> 15) & 1;
         }
-
         break;
-    case RW_SFI_GPRAM_CMD_REG: // FLash数据寄存器
-    {
-        if (data == 1) // 写入数据
+    case DMA_SIM2_CONTROL_REG:
+        if (data == 1)
         {
-            SF_C_Frame.cmd = value & 0xff;
-            SF_C_Frame.address = (value >> 24) | (((value >> 16) & 0xff) << 8) | (((value >> 8) & 0xff) << 16); // 分别是原前8位，中8位，高8位
-            // printf("RW_SFI_GPRAM_DATA = (cmd:%x,address:%x)\n", SF_C_Frame.cmd, SF_C_Frame.address);
+            vm_dma_sim2_config.control = value;
+            vm_dma_sim2_config.chanel = (value >> 20) & 0b11111;
+            vm_dma_sim2_config.direction = (value >> 18) & 1;
+            vm_dma_sim2_config.align = value & 0b11;
+            vm_dma_sim2_config.transfer_end_interrupt_enable = (value >> 15) & 1;
         }
-        else // 读取数据
+        break;
+    case DMA_MSDC_DATA_ADDR_REG:
+        if (data == 1)
+            vm_dma_msdc_config.data_addr = value;
+        break;
+    case DMA_SIM1_DATA_ADDR_REG:
+        if (data == 1)
+            vm_dma_sim1_config.data_addr = value;
+        break;
+    case DMA_SIM2_DATA_ADDR_REG:
+        if (data == 1)
+            vm_dma_sim2_config.data_addr = value;
+        break;
+
+    case DMA_MSDC_TRANSFER_COUNT_REG:
+        if (data == 1)
         {
-            switch (SF_C_Frame.cmd)
+            if (vm_dma_msdc_config.align == DMA_DATA_BYTE_ALIGN_FOUR)
+                value *= 4;
+            if (vm_dma_msdc_config.align == DMA_DATA_BYTE_ALIGN_TWO)
+                value *= 2;
+            vm_dma_msdc_config.transfer_count = value;
+        }
+        break;
+    case DMA_SIM1_TRANSFER_COUNT_REG:
+        if (data == 1)
+        {
+            if (vm_dma_sim1_config.align == DMA_DATA_BYTE_ALIGN_FOUR)
+                value *= 4;
+            if (vm_dma_sim1_config.align == DMA_DATA_BYTE_ALIGN_TWO)
+                value *= 2;
+            vm_dma_sim1_config.transfer_count = value;
+        }
+        break;
+    case DMA_SIM2_TRANSFER_COUNT_REG:
+        if (data == 1)
+        {
+            if (vm_dma_sim2_config.align == DMA_DATA_BYTE_ALIGN_FOUR)
+                value *= 4;
+            if (vm_dma_sim2_config.align == DMA_DATA_BYTE_ALIGN_TWO)
+                value *= 2;
+            vm_dma_sim2_config.transfer_count = value;
+        }
+        break;
+    case DMA_MSDC_START_REG:
+        // 写入0x8000表示DMA开始运行
+        if (data == 1)
+        {
+            if (value == 0x8000)
             {
-            case 0x9f: // 读取Flash芯片信息
-                uc_mem_write(MTK, RW_SFI_GPRAM_CMD_REG, &(SF_C_Frame.SendData[SF_C_Frame.sentCount]), 4);
-                SF_C_Frame.sentCount += 4;
-                SF_C_Frame.sendDataCount -= 4;
-                if (SF_C_Frame.sendDataCount == 0) // 数据发送完成
+                if (vm_dma_msdc_config.chanel == MSDC)
                 {
-                    changeTmp = 2;
-                    uc_mem_write(MTK, RW_SFI_MAC_CTL, &changeTmp, 4);
-                    SF_C_Frame.sendDataMode = false;
-                    free(SF_C_Frame.SendData);
-                    SF_C_Frame.SendData = NULL;
+                    vm_dma_msdc_config.config_finish = 1;
                 }
-                break;
-            default:
-                // printf("未处理的SPI FLASH命令(%x)\n", SF_C_Frame.cmd);
-                break;
-            }
-        }
-        break;
-    }
-
-    case RW_SFI_MAC_CTL: // Flash控制寄存器
-    {
-        // dumpCpuInfo();
-        if (data == 1)
-        {
-            if (value & 4)
-            {
-                SF_C_Frame.cmdRev = 1;
-            }
-        }
-        else
-        {
-            if (SF_C_Frame.cmdRev)
-            {
-                // printf("Exec SFI Cmd[0x%x][0x%d]\n", SF_C_Frame.cmd,SF_C_Frame.address);
-                //  触发命令发送和启用宏模式
-                switch (SF_C_Frame.cmd)
+                else
                 {
-                case 0x2: // 写一页数据
-                          // 计算页地址，并擦除所在页
-                    // changeTmp1 = (SF_C_Frame.address / 256) * 256;
-                    sendCount = SF_C_Frame.sendDataCount - 4; // 减去1cmd 3addr就是实际写入长度
-                    changeTmp = 0x8000000 | SF_C_Frame.address;
-                    // printf("flash addr::%x\n", SF_C_Frame.address);
-                    //  地址4字节对齐
-                    uc_mem_write(MTK, changeTmp, &(SF_C_Frame.cacheData), sendCount);
-                    // writeFlashFile(&SF_C_Frame.cacheData, SF_C_Frame.address - 0x780000, sendCount);
-                    SF_C_Frame.cmdRev = 0;
-                    // printf("Write Flash Address[%x] Value[%x] Size[%d]\n", SF_C_Frame.address, SF_C_Frame.cacheData[0], sendCount);
-                    break;
-                case 0x5:          // 读状态寄存器
-                    changeTmp = 0; // 表示不忙
-                    uc_mem_write(MTK, RW_SFI_GPRAM_CMD_REG, &changeTmp, 4);
-                    break;
-                case 0x1:  // 写状态寄存器
-                case 0x6:  // 允许写入
-                case 0xb9: // 切换到正常模式
-                case 0xaf: // 切换到深度掉电模式
-                case 0x50: // 未知
-                case 0x38: // 未知
-                    if (SF_C_Frame.cmdRev == 1)
-                    {
-                        SF_C_Frame.cmdRev = 2;
-                    }
-                    else
-                    {
-                        changeTmp = 2;
-                        SF_C_Frame.cmdRev = 0;
-                        uc_mem_write(MTK, RW_SFI_MAC_CTL, &changeTmp, 4);
-                    }
-                    break;
-                case 0x9f: // 读取三字节Flash ID信息
-                    SF_C_Frame.sendDataMode = true;
-                    SF_C_Frame.SendData[0] = 1;
-                    SF_C_Frame.SendData[1] = 2;
-                    SF_C_Frame.SendData[2] = 3;
-                    SF_C_Frame.cmdRev = 0;
-                    break;
-                default:
-                    break;
+                    printf("unhandle msdc dma chanel[%x]\n", vm_dma_msdc_config.chanel);
                 }
             }
         }
         break;
-    }
-    case 0xA10003F6:
-    {
-        if (data == 0)
+    case DMA_SIM1_START_REG:
+        // 写入0x8000表示DMA开始运行
+        if (data == 1)
         {
-            changeTmp = 0x8888;
-            uc_mem_write(MTK, (u32)address, &changeTmp, 2);
+            if (value == 0x8000)
+            {
+                if (vm_dma_sim1_config.chanel == 0)
+                {
+                    vm_dma_sim1_config.config_finish = 1;
+                    printf("SIM卡1的DMA开启(%d)\n", irq_nested_count);
+                }
+                else
+                {
+                    printf("unhandle sim1 dma chanel[%x]\n", vm_dma_sim1_config.chanel);
+                }
+            }
         }
         break;
-    }
-    case 0x81020000: // 跟MSDC有关的
-    {
-        changeTmp = 0x8000;
-        uc_mem_write(MTK, (u32)address, &changeTmp, 4);
+    case DMA_SIM2_START_REG:
+        // 写入0x8000表示DMA开始运行
+        if (data == 1)
+        {
+            if (value == 0x8000)
+            {
+                if (vm_dma_sim2_config.chanel == 0x13)
+                {
+                    printf("SIM卡2的DMA开启\n");
+                    vm_dma_sim2_config.config_finish = 1;
+                }
+                else
+                {
+                    printf("unhandle sim2 dma chanel[%x]\n", vm_dma_sim2_config.chanel);
+                }
+            }
+        }
         break;
-    }
-    case SDC_DATSTA_REG:
-    {
-        changeTmp = 0x8000;
-        uc_mem_write(MTK, (u32)address, &changeTmp, 4);
-        break;
-    }
     case 0x810C0090: // 读寄存器，返回0x10过sub_8122d8c的while
     {
         if (data == 0)
@@ -1101,7 +1292,7 @@ case 0xF01DC4FC:
     }
     case SD_DATA_RESP_REG0:
     { // SD 命令响应数据寄存器 r0,r1,r2,r3每个寄存器占用4字节
-        switch (SDCMD_CACHE)
+        switch (MSDC_CMD_CACHE)
         {
         case SDC_CMD_CMD0: // 进入SPI模式
             // printf("SD卡 进入SPI模式(%x)\n", SEND_SDDATA_CACHE);
@@ -1157,24 +1348,44 @@ case 0xF01DC4FC:
             // printf("SD卡 设置SD数据块长度(%x)\n", SEND_SDDATA_CACHE);
             // DMA_Transfer_Bytes_Count = SEND_SDDATA_CACHE;
             break;
-        case SDC_CMD_CMD17: // 它的作用是从 SD 卡中读取一个单独的数据块
-            SD_READ_ADDR = SEND_SDDATA_CACHE;
-            // printf("SD Ready Read:(0x%x)\n", SEND_SDDATA_CACHE);
+        case SDC_CMD_CMD18: // 读取多个数据块
+        case SDC_CMD_CMD17: // 读取单个数据块
+            if (vm_dma_msdc_config.config_finish == 1)
+            {
+                dataCachePtr = readSDFile(MSDC_DATA_ADDR, vm_dma_msdc_config.transfer_count);
+                if (dataCachePtr != NULL)
+                {
+                    uc_mem_write(MTK, vm_dma_msdc_config.data_addr, dataCachePtr, vm_dma_msdc_config.transfer_count);
+                    free(dataCachePtr);
+                }
+                // msdc dma传输完成
+                vm_dma_msdc_config.config_finish = 0;
+                changeTmp = 0x8000;
+                uc_mem_write(MTK, SDC_DATSTA_REG, &changeTmp, 4);
+                if (vm_dma_msdc_config.transfer_end_interrupt_enable == 1)
+                {
+                    vm_dma_msdc_config.transfer_end_interrupt_enable = 0;
+                    StartCallback(0x816D9F0 + 1, 0);
+                }
+            }
             //  printf("调用地址(%x)\n", lastAddress);
             break;
-        case SDC_CMD_CMD18:
-            SD_READ_ADDR = SEND_SDDATA_CACHE;
-            // DMA_Transfer_Bytes_Count = SD_Multi_Read_Count;
-            // printf("SD Ready Multi-Read:(0x%x)\n", SEND_SDDATA_CACHE);
+        case SDC_CMD_CMD25: // 写多个数据块
+        case SDC_CMD_CMD24: // 写单个数据块
+            if (vm_dma_msdc_config.config_finish == 1)
+            {
+                vm_dma_msdc_config.config_finish = 0;
+                uc_mem_read(MTK, vm_dma_msdc_config.data_addr, vm_dma_msdc_config.cacheBuffer, vm_dma_msdc_config.transfer_count);
+                writeSDFile(vm_dma_msdc_config.cacheBuffer, MSDC_DATA_ADDR, vm_dma_msdc_config.transfer_count);
+                changeTmp = 0x8000;
+                uc_mem_write(MTK, SDC_DATSTA_REG, &changeTmp, 4);
+                if (vm_dma_msdc_config.transfer_end_interrupt_enable == 1)
+                {
+                    vm_dma_msdc_config.transfer_end_interrupt_enable = 0;
+                    StartCallback(0x816D9F0 + 1, 0);
+                }
+            }
             break;
-        case SDC_CMD_CMD24:
-            SD_Write_ADDR = SEND_SDDATA_CACHE;
-            // printf("SD Ready Write:(0x%x)\n", SEND_SDDATA_CACHE);
-            break;
-        case SDC_CMD_CMD25:
-            SD_Write_ADDR = SEND_SDDATA_CACHE;
-            // SD_Read_Count = SD_Multi_Read_Count;
-            // printf("SD Ready Multi-Write:(%x)\n", SEND_SDDATA_CACHE);
             break;
         case SDC_CMD_ACMD42: // 卡检测信号通常用于检测 SD 卡是否插入或取出
             // printf("SD卡 检查是否插入或取出(%x)\n", SEND_SDDATA_CACHE);
@@ -1191,7 +1402,7 @@ case 0xF01DC4FC:
     }
     case SD_DATA_RESP_REG1:
     {
-        switch (SDCMD_CACHE)
+        switch (MSDC_CMD_CACHE)
         {
         case SDC_CMD_CMD2: // 返回CID寄存器
             changeTmp1 = 0x77;
@@ -1211,7 +1422,7 @@ case 0xF01DC4FC:
     }
     case SD_DATA_RESP_REG2:
     {
-        switch (SDCMD_CACHE)
+        switch (MSDC_CMD_CACHE)
         {
         case SDC_CMD_CMD2: // 返回CID寄存器
             changeTmp1 = 0;
@@ -1234,7 +1445,7 @@ case 0xF01DC4FC:
     case SD_DATA_RESP_REG3:
     {
 
-        switch (SDCMD_CACHE)
+        switch (MSDC_CMD_CACHE)
         {
         case SDC_CMD_CMD2: // 返回CID寄存器
             changeTmp1 = 0x3;
@@ -1258,7 +1469,7 @@ case 0xF01DC4FC:
     }
     case SD_CMD_RESP_REG0:
     {
-        switch (SDCMD_CACHE)
+        switch (MSDC_CMD_CACHE)
         {
         case 0:
             break;
@@ -1289,7 +1500,7 @@ case 0xF01DC4FC:
     }
     case SD_CMD_RESP_REG1:
     {
-        switch (SDCMD_CACHE)
+        switch (MSDC_CMD_CACHE)
         {
         case SDC_CMD_CMD2:
             changeTmp1 = 0x77;
@@ -1318,7 +1529,7 @@ case 0xF01DC4FC:
     }
     case SD_CMD_RESP_REG2:
     {
-        switch (SDCMD_CACHE)
+        switch (MSDC_CMD_CACHE)
         {
         case 0:
             break;
@@ -1361,7 +1572,7 @@ case 0xF01DC4FC:
     }
     case SD_CMD_RESP_REG3:
     {
-        switch (SDCMD_CACHE)
+        switch (MSDC_CMD_CACHE)
         {
         case SDC_CMD_CMD2:
             changeTmp1 = 0x3;
@@ -1381,7 +1592,7 @@ case 0xF01DC4FC:
     {
         if (data == 1)
         {
-            SEND_SDDATA_CACHE = value;
+            MSDC_DATA_ADDR = value;
         }
         break;
     }
@@ -1389,9 +1600,8 @@ case 0xF01DC4FC:
     {
         if (data == 1)
         {
-            SEND_SDCMD_CACHE = value;
             // 取0x40000000后16位
-            SDCMD_CACHE = value & 0xffff;
+            MSDC_CMD_CACHE = value & 0xffff;
         }
         break;
     }
@@ -1403,18 +1613,6 @@ case 0xF01DC4FC:
         }
         break;
     }
-        /*
-        case IRQ_EOIL: // 置1表示中断正在处理中，置0表示处理完成
-            if (data == 1)
-                printf("中断结束(%x)\n", value);
-            break;*/
-        /*
-            case IRQ_MASK_STA_L: // 置1屏蔽中断，置0允许中断
-                if (data == 1)
-                {
-                    printf("中断状态设置(%x)\n", value);
-                }
-                break;*/
     case IRQ_MASK_SET_L: // 置1表示禁用对应mask位置，表示不进入中断处理函数
     {
         if (data == 1) // 禁止中断
@@ -1425,7 +1623,6 @@ case 0xF01DC4FC:
 
         break;
     }
-
     case IRQ_CLR_MASK_L: // 置1表示可以进入中断处理函数
     {
         if (data == 1)
@@ -1435,8 +1632,96 @@ case 0xF01DC4FC:
         }
         break;
     }
+
+    case RW_SFI_OUTPUT_LEN_REG: // 输出到Flash寄存器的字节数
+        if (data == 1)
+        {
+            SF_C_Frame.sendDataCount = value;
+        }
+        break;
+    case RW_SFI_INPUT_LEN_REG: // 从Flash寄存器读取的字节数
+        if (data == 1)
+        {
+            SF_C_Frame.readDataCount = value;
+        }
+        break;
+    case RW_SFI_MAC_CTL: // Flash控制寄存器
+    {
+        if (data == 1)
+        {
+            changeTmp1 = value;
+            if ((changeTmp1 & 0xc) == 0xc)
+            {
+                if (SF_C_Frame.cmdRev == 0)
+                {
+                    SF_C_Frame.cmdRev = 1; // 命令接收完成
+                }
+            }
+        }
+        else
+        {
+            if (SF_C_Frame.cmdRev == 1)
+            {
+                changeTmp1 = SF_C_Frame.cacheData[0];
+                SF_C_Frame.cmd = changeTmp1 & 0xff;
+                SF_C_Frame.address = (changeTmp1 >> 24) | (((changeTmp1 >> 16) & 0xff) << 8) | (((changeTmp1 >> 8) & 0xff) << 16);
+                switch (SF_C_Frame.cmd)
+                {
+                case 0x2: // SF_CMD_PAGE_PROG
+                          // 计算页地址
+                          // changeTmp1 = (SF_C_Frame.address / 256) * 256;
+                    // 分别是原前8位，中8位，高8位
+                    // printf("flash addr::%x\n", SF_C_Frame.address);
+                    // 减去1cmd 3addr 就是实际写入长度，所以是 - 4
+                    //  地址4字节对齐
+                    changeTmp = 0x8000000 | SF_C_Frame.address;
+                    uint64_t start = (uint64_t)(&SF_C_Frame.cacheData);
+                    SF_C_Frame.sendDataCount -= 4; // 减去4字节(1字节命令和3字节地址)
+                    uc_mem_write(MTK, changeTmp, start + 4, SF_C_Frame.sendDataCount);
+                    break;
+                case 0x5: // SF_CMD_READ_SR
+                    changeTmp = SF_C_Frame.SR_REG[0];
+                    changeTmp |= (SF_C_Frame.SR_REG[1] << 8);
+                    changeTmp |= (SF_C_Frame.SR_REG[2] << 16);
+                    // changeTmp = 0; // 表示不忙
+                    uc_mem_write(MTK, RW_SFI_GPRAM_DATA_REG, &changeTmp, 4);
+                    break;
+                case 0x1: // SF_CMD_WRITE_SR
+                    changeTmp = SF_C_Frame.cacheData[0];
+                    SF_C_Frame.SR_REG[0] = changeTmp & 0xff;
+                    SF_C_Frame.SR_REG[1] = (changeTmp >> 8) & 0xff;
+                    SF_C_Frame.SR_REG[2] = (changeTmp >> 16) & 0xff;
+                    break;
+                case 0x6:  // SF_CMD_WREN
+                case 0xb9: // SF_CMD_ENTER_DPD
+                case 0xaf: // SF_CMD_READ_ID_QPI
+                case 0x38: // SF_CMD_SST_QPIEN
+                    break;
+                case 0x9f: // SF_CMD_READ_ID 读取三字节Flash ID信息
+                    changeTmp = 1;
+                    uc_mem_write(MTK, RW_SFI_GPRAM_DATA_REG, &changeTmp, 4);
+                    changeTmp = 2;
+                    uc_mem_write(MTK, RW_SFI_GPRAM_DATA_REG + 4, &changeTmp, 4);
+                    changeTmp = 3;
+                    uc_mem_write(MTK, RW_SFI_GPRAM_DATA_REG + 8, &changeTmp, 4);
+                    break;
+                case 0xc0: // SF_CMD_SST_SET_BURST_LENGTH
+                    break;
+                default:
+                    // printf("unhandle flash cmd[%x]\n", SF_C_Frame.cmd);
+                    break;
+                }
+                SF_C_Frame.cmdRev = 0;
+                SF_C_Frame.cmd = 0;
+                changeTmp = 2;
+                uc_mem_write(MTK, RW_SFI_MAC_CTL, &changeTmp, 4);
+            }
+        }
+        break;
+    }
+
     default:
-        if (address >= RW_SFI_GPRAM_DATA_REG && address <= RW_SFI_GPRAM_DATA_REG + 256) // 假设缓存256字节
+        if (address >= RW_SFI_GPRAM_DATA_REG && address <= (RW_SFI_GPRAM_DATA_REG + 256))
         {
             if (data == 1)
             {
@@ -1444,7 +1729,6 @@ case 0xF01DC4FC:
                 off /= 4;
                 SF_C_Frame.cacheData[off] = value;
             }
-            // printf("Write Flash CacheData(off:%x,value:%x)\n", off, value);
         }
         /*
         // 声音相关寄存器
@@ -1546,126 +1830,72 @@ void hookCodeCallBack(uc_engine *uc, uint64_t address, uint32_t size, void *user
 {
     switch (address)
     {
+    case 0x8370220: // 直接返回开机流程任务全部完成
+        changeTmp1 = 1;
+        uc_reg_write(MTK, UC_ARM_REG_R0, &changeTmp1);
+        break;
+    case 0x81b38d0:
+        uc_reg_read(MTK, UC_ARM_REG_R1, &changeTmp1);
+        printf("l1audio_sethandler(%x)\n", changeTmp1);
+        break;
+    case 0x8087256:
+        uc_reg_read(MTK, UC_ARM_REG_R0, &changeTmp1);
+        // changeTmp1 = 0x20;
+        // uc_reg_write(MTK, UC_ARM_REG_R0, &changeTmp1);
+        printf("sim_check_status v26(%x)\n", changeTmp1);
+        break;
+    case 0x80D2EE0:
+        uc_reg_read(MTK, UC_ARM_REG_R2, &changeTmp1);
+        lastSIM_DMA_ADDR = changeTmp1;
+        printf("SIM_CMD(r0,r1,rx_result:%x)\n", changeTmp1);
+        break;
+    case 0x819f5b4:
+        uc_reg_read(MTK, UC_ARM_REG_R0, &changeTmp1);
+        uc_mem_read(MTK, changeTmp1, &globalSprintfBuff, 128);
+        printf("kal_debug_print(%s)(%x)\n", globalSprintfBuff, lastAddress);
+        break;
+    case 0x82D2A22: // mr_sprintf
+        uc_mem_read(MTK, 0xF028EDC4, &globalSprintfBuff, 128);
+        printf("mr_sprintf(%s)\n", globalSprintfBuff);
+        break;
         /*
-    case 0x8018516:
-        uc_reg_read(MTK,UC_ARM_REG_R1, &changeTmp1);
-        uc_reg_read(MTK,UC_ARM_REG_R0, &changeTmp);
-        printf("l1audio.postHisr() %x(%x)\n", changeTmp1, changeTmp);
+    case 0x823dbe0:
+        uc_reg_read(MTK, UC_ARM_REG_R1, &changeTmp1);
+        uc_mem_read(MTK, changeTmp1, &globalSprintfBuff, 128);
+        printf("kal_trace_mr(%s)\n", globalSprintfBuff);
+        break;*/
+    case 0x81a4d54:
+        uc_reg_read(MTK, UC_ARM_REG_R0, &changeTmp1);
+        uc_mem_read(MTK, changeTmp1, &globalSprintfBuff, 128);
+        printf("dbg_print(%s)[%x]\n", globalSprintfBuff, lastAddress);
         break;
 
-    case 0x80184FC:
-        uc_reg_read(MTK,UC_ARM_REG_R1, &changeTmp1);
-        uc_reg_read(MTK,UC_ARM_REG_R0, &changeTmp);
-        printf("l1audio.postHisr() %x(%x)\n", changeTmp1, changeTmp);
-        break;
-        */
         /*
-    case 0x819f274:
-    {
-        uc_reg_read(MTK,UC_ARM_REG_R0, &changeTmp);
-        uc_reg_read(MTK,UC_ARM_REG_R1, &changeTmp1);
-        uc_reg_read(MTK,UC_ARM_REG_R2, &changeTmp2);
-        uc_mem_read(MTK,changeTmp2, &globalSprintfBuff, 128);
-        printf("IRQ_Register_LISR num[%d] entry[%x] comment: %s\n", changeTmp, changeTmp1, globalSprintfBuff);
+    case 0x8240088:
+        uc_reg_read(MTK, UC_ARM_REG_R1, &changeTmp1);
+        uc_mem_read(MTK, changeTmp1, &globalSprintfBuff, 128);
+        printf("kal_sprintf(%s)\n", globalSprintfBuff);
         break;
-    }*/
-    /*
-    case 0x83D5E74:
-        changeTmp1 = 0xB28000;
-        uc_reg_write(MTK,4, &changeTmp1); // 650kb重写
-        break;
-    */
+
+    case 0x819f5b4:
+        uc_reg_read(MTK, UC_ARM_REG_R0, &changeTmp1);
+        uc_mem_read(MTK, changeTmp1, &globalSprintfBuff, 128);
+        printf("kal_debug_print(%s)\n", globalSprintfBuff);
+        break;*/
     case 0x83D1C28: // mr_mem_get()
         changeTmp1 = 0;
         uc_mem_write(MTK, 0xF0166068, &changeTmp1, 4); // 为什么在初始化的时候这里设置为1，原本应该为0
         break;
-    case 0x82ACC00: // 模拟器不需要中断回调DMA，所以默认is_poll为true
-        changeTmp1 = 1;
-        uc_reg_write(MTK, UC_ARM_REG_R5, &changeTmp1);
-        break;
-        // case 0x81A0F1C:// stack_print
-        /*
-        case 0x81B1DA4: // tst_sys_trace
-            uc_reg_read(MTK, UC_ARM_REG_R0, &changeTmp1);
-            uc_mem_read(MTK, changeTmp1, &globalSprintfBuff, 128);
-            printf("tst_sys_trace(%s)(%x)\n", globalSprintfBuff);
-            break;
-        case 0x8239244: // 这两个内容相同但地址不一样?
-        case 0x8a3dbe0:
-            uc_reg_read(MTK, UC_ARM_REG_R1, &changeTmp1);
-            uc_mem_read(MTK, changeTmp1, &globalSprintfBuff, 128);
-            printf("kal_prompt_trace(%s)(%x)\n", globalSprintfBuff, lastAddress);
-            break;*/
-        /*
-    case 0x823dbe0: // kal_prompt_trace_mr
-        uc_reg_read(MTK,UC_ARM_REG_R1, &changeTmp1);
-        uc_mem_read(MTK,changeTmp1, &globalSprintfBuff, 128);
-        printf("kal_prompt_trace_mr(%s)\n", globalSprintfBuff);
-        break;
-        */
-        /*
-    case 0x8240088: //_Ven_AT_L___sprintf
-                    //    case 0x8A3BDE0: // kal_prompt_trace
-        // uc_reg_read(MTK,UC_ARM_REG_R0, &lastSprintfPtr); // 记录第一个参数
-        break;
-    case 0x82400AE: //_Ven_AT_L___sprintf
-        // uc_mem_read(MTK,lastSprintfPtr, &globalSprintfBuff, 128); // 输出处理后的数据
-        // printf("_Ven_AT_L___sprintf(%s)\n", globalSprintfBuff);
-        break;
-    case 0x83CE898:
-        uc_reg_read(MTK,UC_ARM_REG_R0, &changeTmp);
-        uc_reg_read(MTK,UC_ARM_REG_R1, &changeTmp1);
-        uc_reg_read(MTK,UC_ARM_REG_R2, &changeTmp2);
-        printf("idle refresh sim status(%x,%x,%x)\n", changeTmp, changeTmp1, changeTmp2);
-        break;
-    case 0x835D824:
-        uc_reg_read(MTK,UC_ARM_REG_R0, &changeTmp2);
-        changeTmp3 = lastAddress;
-        break;*/
-        /*
-    case 0x835D836:
-        uc_reg_read(MTK,UC_ARM_REG_R0, &changeTmp1);
-        uc_mem_read(MTK,changeTmp1, &globalSprintfBuff, 128);
-        ucs2_to_utf8(globalSprintfBuff, 128, sprintfBuff, 128);
-        printf("ui_get_string(id:%x)(%s)(%x)\n", changeTmp2, sprintfBuff, changeTmp3);
-        break;*/
-        /*
-    case 0x8261CA8:
-    case 0x8261Cb0:
-    {
-        uc_reg_read(MTK,UC_ARM_REG_R0, &changeTmp1);
-        ReadReg(4, &changeTmp2);
-        uc_mem_read(MTK,changeTmp1, &globalSprintfBuff, 128);
-        ucs2_to_utf8(globalSprintfBuff, 128, sprintfBuff, 128);
-        printf("get_string(id:%x)(%s)(%x)\n", changeTmp2, sprintfBuff, lastAddress);
-        break;
-    }*/
-        /*
-        case 0x81D51D8:
-            confirm("error", "kal fatal error has occured");
-            break;
-        case 0x82ac688: // MSDC_DMATransferFinal
-            break;*/
-        /*
-    case 0x82EEBF8:
-        uc_reg_read(MTK,UC_ARM_REG_R0, &changeTmp1);
-        printf("抛出异常(%d)(%x)\n", changeTmp1, lastAddress);
-        changeTmp1 = 0;
-        break;*/
     case 0x83890C8:
         // srv_charbat_get_charger_status默认返回1，是充电状态
         changeTmp1 = 1;
         uc_reg_write(MTK, UC_ARM_REG_R0, &changeTmp1);
         break;
-    case 0x8370220: // 直接返回开机流程任务全部完成
-        changeTmp1 = 1;
-        uc_reg_write(MTK, UC_ARM_REG_R0, &changeTmp1);
-        // printf("mmi_frm_proc_con_can_complete(%x)\n", changeTmp1);
-        break;
     case 0x80E7482:
+        // todo 强制过 nvram_util_caculate_checksum检测，原因后面再看
         uc_reg_read(MTK, UC_ARM_REG_R0, &changeTmp);
+        uc_reg_read(MTK, UC_ARM_REG_R2, &changeTmp1);
         // printf("nvram_checksum_compare(%x,%x)\n", changeTmp, changeTmp1);
-        // todo 强制过检测，原因后面再看
         uc_reg_write(MTK, UC_ARM_REG_R2, &changeTmp);
         break;
     case 0x8093FB2: // 强制过8093ffa方法
@@ -1681,7 +1911,7 @@ void hookCodeCallBack(uc_engine *uc, uint64_t address, uint32_t size, void *user
     case 0x80601ec:
     case 0x80601ac: // 过sub_8060194的while(L1D_WIN_Init_SetCommonEvent) 暂时去不掉
         uc_reg_read(MTK, UC_ARM_REG_R0, &changeTmp);
-        uc_mem_write(MTK, 0x82000000, &changeTmp, 4);
+        uc_mem_write(MTK, TMDA_BASE, &changeTmp, 4);
         break;
     case 0x8223F66: // 过sub_8223f5c(L1层的) 暂时去不掉
         changeTmp = 0;
@@ -1691,43 +1921,10 @@ void hookCodeCallBack(uc_engine *uc, uint64_t address, uint32_t size, void *user
         changeTmp = 0;
         uc_reg_write(MTK, UC_ARM_REG_R0, &changeTmp);
         break;
-    case 0x4000801E: // 过方法sub_87035D4
-        changeTmp = 1;
-        uc_reg_write(MTK, UC_ARM_REG_R0, &changeTmp);
-        break;
     default:
-        if (simulateKey != -1)
-        {
-            // 按键中断8号中断线
-            if (StartInterrupt(8, address))
-            {
-                SimulatePressKey(simulateKey, simulatePress);
-                simulateKey = -1;
-            }
-        }
-        else if (currentTime >= last_timer_interrupt_time)
-        {
-            last_timer_interrupt_time = currentTime + interruptPeroidms;
-            // 定时中断2号中断线
-            StartInterrupt(2, address);
-        }
-        /*
-        else if (currentTime >= last_rtc_interrupt_time)
-        {
-            last_rtc_interrupt_time = currentTime + 500;
-            if (StartInterrupt(14, address))
-            {
-                Update_RTC_Time();
-                printf("update rtc\n");
-            }
-        }
-        else if (debugType == 10)
-        {
-            StartInterrupt(12, address);
-            debugType = 0;
-        }*/
         break;
     }
+    lastAddress = address;
 }
 // 通过中断进行回调
 bool StartInterrupt(u32 irq_line, u32 lastAddr)
@@ -1737,7 +1934,7 @@ bool StartInterrupt(u32 irq_line, u32 lastAddr)
         uc_reg_read(MTK, UC_ARM_REG_CPSR, &changeTmp);
         if (!isIRQ_Disable(changeTmp))
         {
-            changeTmp1 = 0x50000004;
+            changeTmp1 = CPU_ISR_CB_ADDRESS + 4;
             SaveCpuContext(&isrStackList[irq_nested_count++], lastAddr);
 
             uc_reg_write(MTK, UC_ARM_REG_LR, &changeTmp1); // LR更新为特殊寄存器
@@ -1753,16 +1950,20 @@ bool StartInterrupt(u32 irq_line, u32 lastAddr)
     }
     return false;
 }
-
-void StartCallback(u32 callbackAddr, u32 backAddr, u32 r0)
+/**
+ * 执行函数回调
+ */
+void StartCallback(u32 callbackFuncAddr, u32 r0)
 {
-    isEnterCallback = true;
-    changeTmp1 = 0x50000008;
+    u32 backAddr;
+    u32 lr = CPU_ISR_CB_ADDRESS + 8;
+    uc_reg_read(MTK, UC_ARM_REG_PC, &backAddr);
+
     SaveCpuContext(&stackCallback, backAddr);
     // 开始回调
     uc_reg_write(MTK, UC_ARM_REG_R0, &r0);
-    uc_reg_write(MTK, UC_ARM_REG_PC, &callbackAddr);
-    uc_reg_write(MTK, UC_ARM_REG_LR, &changeTmp1);
+    uc_reg_write(MTK, UC_ARM_REG_PC, &callbackFuncAddr);
+    uc_reg_write(MTK, UC_ARM_REG_LR, &lr);
 }
 
 void SaveCpuContext(u32 *stackCallbackPtr, u32 backAddr)
@@ -1770,43 +1971,17 @@ void SaveCpuContext(u32 *stackCallbackPtr, u32 backAddr)
     uc_reg_read(MTK, UC_ARM_REG_CPSR, stackCallbackPtr);
     if (*stackCallbackPtr++ & 0x20)
         backAddr += 1;
+    int regs[] = {UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7, UC_ARM_REG_R8, UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11, UC_ARM_REG_R12, UC_ARM_REG_R13, UC_ARM_REG_LR};
+    u32 *addr[] = {stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++};
     // 保存状态
-    uc_reg_read(MTK, UC_ARM_REG_R0, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R1, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R2, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R3, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R4, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R5, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R6, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R7, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R8, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R9, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R10, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R11, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R12, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_R13, stackCallbackPtr++);
-    uc_reg_read(MTK, UC_ARM_REG_LR, stackCallbackPtr++);
+    uc_reg_read_batch(MTK, &regs, &addr, 15);
     *stackCallbackPtr = backAddr;
 }
 
 void RestoreCpuContext(u32 *stackCallbackPtr)
 {
     // 还原状态
-    uc_reg_write(MTK, UC_ARM_REG_CPSR, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R0, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R1, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R2, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R3, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R4, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R5, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R6, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R7, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R8, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R9, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R10, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R11, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R12, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_R13, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_LR, stackCallbackPtr++);
-    uc_reg_write(MTK, UC_ARM_REG_PC, stackCallbackPtr++);
+    int regs[] = {UC_ARM_REG_CPSR, UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3, UC_ARM_REG_R4, UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7, UC_ARM_REG_R8, UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11, UC_ARM_REG_R12, UC_ARM_REG_R13, UC_ARM_REG_LR, UC_ARM_REG_PC};
+    u32 *addr[] = {stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++, stackCallbackPtr++};
+    uc_reg_write_batch(MTK, &regs, &addr, 17);
 }

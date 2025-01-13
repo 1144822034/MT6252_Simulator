@@ -14,4 +14,4 @@ SDL2 = Lib/sdl2-2.0.10
 build:
 	$(CC) $(CFLAGS) \
 	src/main.c -o bin/main.exe \
-	$^ $(UNICORN) -lpthread -lm -lws2_32 -lmingw32 -L$(SDL2)/lib/ -lSDL2main -lSDL2
+	$^ $(UNICORN) -lpthread -lm -lws2_32 -lmingw32 -L$(SDL2)/lib -lSDL2main -lSDL2

@@ -8,3 +8,12 @@
 #define FLASH_IMG_LOCK_PATH "Rom\\flash.lock"
 // 系统固件文件
 #define ROM_PROGRAM_BIN "Rom\\08000000.bin"
+// LCD屏幕宽度
+#define LCD_SCREEN_WIDTH 240
+// LCD屏幕高度
+#define LCD_SCREEN_HEIGHT 320
+// CPU中断服务地址
+#define CPU_ISR_CB_ADDRESS 0x50000000
+
+// 中断间隔
+#define interruptPeroidms 5
