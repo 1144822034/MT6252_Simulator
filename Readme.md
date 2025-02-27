@@ -1,3 +1,5 @@
+![:name](https://count.getloli.com/@:mtk6252SimulatorGitee)
+
 # 基于Unicorn Engine的手机固件模拟器
 ### 使用的是手机型号IHD 316的固件，手机搭载CPU为MT6252
 
